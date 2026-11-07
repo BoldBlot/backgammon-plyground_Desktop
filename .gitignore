@@ -1,0 +1,7 @@
+build/
+.gradle/
+.kotlin/
+local.properties
+.~lock*
+work orders/
+hs_err_pid*.log

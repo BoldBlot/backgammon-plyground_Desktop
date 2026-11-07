@@ -1,0 +1,564 @@
+package com.boldblot.backgammonplyground.data
+
+import com.boldblot.backgammonplyground.core.AutoLabel
+import com.boldblot.backgammonplyground.core.Blunders
+import com.boldblot.backgammonplyground.core.CpuLevel
+import com.boldblot.backgammonplyground.core.DecisionRecord
+import com.boldblot.backgammonplyground.core.DiceTotals
+import com.boldblot.backgammonplyground.core.Elo
+import com.boldblot.backgammonplyground.core.EngineKind
+import com.boldblot.backgammonplyground.core.MistakeRate
+import com.boldblot.backgammonplyground.core.Opponent
+import com.boldblot.backgammonplyground.core.GameState
+import com.boldblot.backgammonplyground.core.GameSummary
+import com.boldblot.backgammonplyground.core.Labels
+import com.boldblot.backgammonplyground.core.MatImport
+import com.boldblot.backgammonplyground.core.turned
+import com.boldblot.backgammonplyground.core.MatchRules
+import com.boldblot.backgammonplyground.core.MatchState
+import com.boldblot.backgammonplyground.core.PerformanceTotals
+import com.boldblot.backgammonplyground.core.Severity
+import com.boldblot.backgammonplyground.core.StudyPosition
+import com.boldblot.backgammonplyground.core.Summaries
+import com.boldblot.backgammonplyground.core.Player
+import com.boldblot.backgammonplyground.core.WinType
+import com.boldblot.backgammonplyground.core.XgRules
+import androidx.room.useWriterConnection
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+
+val AppJson = Json {
+    ignoreUnknownKeys = true
+    encodeDefaults = true
+}
+
+enum class MatchTypeFilter(val label: String) { ALL("All"), MATCHES("Matches"), MONEY("Money") }
+
+enum class PeriodFilter(val label: String, val days: Int?) {
+    ALL("All time", null), DAYS_30("30 days", 30), DAYS_7("7 days", 7)
+}
+
+data class StatsFilter(
+    val type: MatchTypeFilter = MatchTypeFilter.ALL,
+    val period: PeriodFilter = PeriodFilter.ALL,
+)
+
+/** PR of one finished match / session: total, checker play and cube (null without such decisions). */
+data class PrPoint(val time: Long, val pr: Double, val checkerPr: Double?, val cubePr: Double?, val length: Int)
+
+data class StatsReport(
+    val matchesPlayed: Int,
+    val matchesWon: Int,
+    val gamesPlayed: Int,
+    val gamesWon: Int,
+    val gammonsWon: Int,
+    val gammonsLost: Int,
+    val backgammonsWon: Int,
+    val backgammonsLost: Int,
+    val moneyGames: Int,
+    val moneyPointsWon: Int,
+    val moneyPointsLost: Int,
+    val human: PerformanceTotals,
+    val cpu: PerformanceTotals,
+    val humanDice: DiceTotals,
+    val cpuDice: DiceTotals,
+    /** Rating is global (not filtered). */
+    val elo: Double,
+    val eloHistory: List<Pair<Long, Double>>,
+    val experience: Int,
+    /** PR of each finished match/session in the filter, oldest first. */
+    val prHistory: List<PrPoint>,
+) {
+    /** NJ Backgammon / gnubg style error rate: millipoints lost per move of both players. */
+    val njErrorRate: Double?
+        get() {
+            val moves = human.moves + cpu.moves
+            return if (moves == 0) null else 1000.0 * human.totalError / moves
+        }
+}
+
+/**
+ * Totals of the games of one match (or money session) finished so far. [eloBefore] and
+ * [eloAfter] are set once a match has been finished and rated.
+ */
+data class MatchReport(
+    val games: Int,
+    /** Games won: [human, computer]. */
+    val gamesWon: List<Int>,
+    val human: PerformanceTotals,
+    val cpu: PerformanceTotals,
+    val eloBefore: Double? = null,
+    val eloAfter: Double? = null,
+)
+
+/** A saved blunder with its decision decoded. */
+data class SavedBlunder(val entity: BlunderEntity, val decision: DecisionRecord) {
+    /** Its labels' keys (all of them; Settings may hide some). */
+    val labels: Set<String> by lazy {
+        Labels.of(decision, entity.matchLength, entity.opponent).mapTo(HashSet()) { it.name }.also { if (entity.marked) it += AutoLabel.MARKED.name }
+    }
+}
+
+class Repository(private val db: AppDatabase) {
+
+    private val dao = db.matches()
+
+    /** Called with each blunder newly added to the list (linked folders that add new blunders at once). */
+    var onNewBlunder: (suspend (SavedBlunder) -> Unit)? = null
+
+    suspend fun createMatch(rules: MatchRules, level: CpuLevel, mistakes: MistakeRate?, engine: EngineKind = EngineKind.PURETD): Long = dao.insertMatch(
+        MatchEntity(
+            startedAt = System.currentTimeMillis(), length = rules.length, cpuLevel = Opponent.key(level, mistakes, engine),
+            useCube = rules.useCube, jacoby = rules.jacoby, crawford = rules.crawford,
+        ),
+    ).also { enforceLibraryLimit() }
+
+    /** The most games the Match Library keeps (Settings → Data and help); 0 or none = no limit. */
+    var libraryMax: (suspend () -> Int)? = null
+
+    /**
+     * Deletes the oldest finished matches beyond the Match Library's limit (a match in progress is never deleted).
+     * Their saved positions and errors stay. Returns how many went.
+     */
+    suspend fun enforceLibraryLimit(): Int {
+        val max = libraryMax?.invoke()?.takeIf { it > 0 } ?: return 0
+        val old = matchesOverLimit(dao.history(), max)
+        old.forEach { dao.deleteMatchWithGames(it.id) }
+        return old.size
+    }
+
+    // ---- match in progress -----------------------------------------------------
+
+    suspend fun saveCurrent(m: MatchState) = dao.saveCurrent(CurrentMatchEntity(json = AppJson.encodeToString(m)))
+
+    suspend fun loadCurrent(): MatchState? = dao.current()?.let {
+        runCatching { AppJson.decodeFromString<MatchState>(it.json) }.getOrNull()
+    }
+
+    suspend fun clearCurrent() = dao.clearCurrent()
+
+    // ---- results ---------------------------------------------------------------------
+
+    /** Stores a finished game. [m] still contains the finished game and the score before it. */
+    suspend fun saveFinishedGame(m: MatchState, summary: GameSummary) {
+        val g = m.game
+        val r = requireNotNull(g.result)
+        dao.insertGame(
+            GameEntity(
+                matchId = m.id, number = m.gameNumber, finishedAt = System.currentTimeMillis(),
+                winner = r.winner, winType = r.type.name, points = r.points,
+                summary = AppJson.encodeToString(summary), record = AppJson.encodeToString(g),
+                scoreBeforeHuman = m.score[0], scoreBeforeCpu = m.score[1],
+            ),
+        )
+        val entity = dao.match(m.id) ?: return
+        val newScore = m.score.toMutableList().also { it[r.winner] += r.points }
+        dao.upsertMatch(entity.copy(humanScore = newScore[0], cpuScore = newScore[1], games = entity.games + 1))
+    }
+
+    /** Called when a match is finished or a money session ended (Top X per match files its errors then). */
+    var onMatchFinished: (suspend (Long) -> Unit)? = null
+
+    /** Marks the match as finished (or a money session as ended) and updates the rating. */
+    suspend fun finishMatch(m: MatchState, abandoned: Boolean = false) {
+        val entity = dao.match(m.id) ?: return
+        val games = dao.games(m.id).map { AppJson.decodeFromString<GameSummary>(it.summary) }
+        if (games.isEmpty()) {
+            dao.deleteMatch(m.id)
+            return
+        }
+        val human = games.fold(PerformanceTotals()) { acc, s -> acc + s.performance[0] }
+        val cpu = games.fold(PerformanceTotals()) { acc, s -> acc + s.performance[1] }
+        var updated = entity.copy(
+            finishedAt = System.currentTimeMillis(),
+            status = if (abandoned) MatchStatus.ABANDONED else MatchStatus.FINISHED,
+            winner = m.winner,
+            humanPerformance = AppJson.encodeToString(human),
+            cpuPerformance = AppJson.encodeToString(cpu),
+            humanScore = m.score[0], cpuScore = m.score[1],
+        )
+        if (!abandoned && m.rules.length > 0 && m.winner != null && entity.inStats) {
+            val previous = dao.ratedMatchesChronological()
+            val rating = previous.lastOrNull()?.eloAfter ?: Elo.START
+            val experience = previous.sumOf { it.length }
+            val after = Elo.update(
+                rating, experience, Elo.cpuRating(m.cpuLevel, m.mistakes), m.rules.length, won = m.winner == Player.HUMAN,
+            )
+            updated = updated.copy(eloBefore = rating, eloAfter = after)
+        }
+        dao.upsertMatch(updated)
+        onMatchFinished?.invoke(m.id)
+        enforceLibraryLimit()
+    }
+
+    /** Whether match [id] is over (finished, ended or abandoned). */
+    suspend fun matchOver(id: Long): Boolean = dao.match(id)?.let { it.status != MatchStatus.IN_PROGRESS } ?: true
+
+    /** The errors of match [matchId] waiting in New errors (the human's). */
+    suspend fun blundersOf(matchId: Long): List<SavedBlunder> = dao.blundersOfMatch(matchId).filter { !it.opponent && !it.marked }.mapNotNull { e ->
+        runCatching { SavedBlunder(e, AppJson.decodeFromString<DecisionRecord>(e.record)) }.getOrNull()
+    }
+
+    /** Report of the games of match [matchId] finished so far. */
+    suspend fun matchReport(matchId: Long): MatchReport {
+        val games = dao.games(matchId)
+        val summaries = games.mapNotNull { runCatching { AppJson.decodeFromString<GameSummary>(it.summary) }.getOrNull() }
+        val entity = dao.match(matchId)
+        return MatchReport(
+            games = games.size,
+            gamesWon = listOf(games.count { it.winner == Player.HUMAN }, games.count { it.winner == Player.CPU }),
+            human = summaries.fold(PerformanceTotals()) { acc, s -> acc + s.performance[0] },
+            cpu = summaries.fold(PerformanceTotals()) { acc, s -> acc + s.performance[1] },
+            eloBefore = entity?.eloBefore,
+            eloAfter = entity?.eloAfter,
+        )
+    }
+
+    suspend fun history(): List<MatchEntity> = dao.history()
+
+    suspend fun games(matchId: Long): List<Pair<GameEntity, GameState>> =
+        dao.games(matchId).mapNotNull { e ->
+            runCatching { e to AppJson.decodeFromString<GameState>(e.record) }.getOrNull()
+        }
+
+    suspend fun match(id: Long): MatchEntity? = dao.match(id)
+
+    /** Game [number] of match [matchId] with its record, or null (records cleared). */
+    suspend fun savedGame(matchId: Long, number: Int): Pair<GameEntity, GameState>? =
+        dao.game(matchId, number)?.let { e -> runCatching { e to AppJson.decodeFromString<GameState>(e.record) }.getOrNull() }
+
+    /** Finished games with decisions waiting for the background analysis, oldest first. */
+    suspend fun gamesWithPending(): List<GameKey> = dao.gamesWithPending()
+
+    /**
+     * Marks match [matchId]'s decisions that were not analyzed (the human's, and the computer's too
+     * with [cpu]; not autofinish's) for the background analysis. Returns the games that have some.
+     */
+    suspend fun markForAnalysis(matchId: Long, cpu: Boolean): List<GameKey> = games(matchId).mapNotNull { (e, g) ->
+        var marked = false
+        val decisions = g.decisions.map { d ->
+            if (!d.auto && !d.pending && d.checker == null && d.cubeEval == null && (cpu || d.player == Player.HUMAN)) {
+                marked = true
+                d.copy(pending = true)
+            } else d
+        }
+        if (!marked) return@mapNotNull null
+        dao.updateGame(e.copy(record = AppJson.encodeToString(g.copy(decisions = decisions))))
+        GameKey(matchId, e.number)
+    }
+
+    /** Match [matchId]'s decisions waiting for the background analysis are no longer waiting. Returns how many. */
+    suspend fun dropPending(matchId: Long): Int = games(matchId).sumOf { (e, g) ->
+        val n = g.decisions.count { it.pending }
+        if (n > 0) dao.updateGame(e.copy(record = AppJson.encodeToString(g.copy(decisions = g.decisions.map { it.copy(pending = false) }))))
+        n
+    }
+
+    /** The human's errors and blunders in match [matchId]'s finished games, and the first game that has any. */
+    suspend fun humanMistakes(matchId: Long): Pair<Int, Int?> {
+        val games = gameSummaries(matchId)
+        return games.sumOf { it.second.performance[0].mistakes } to games.firstOrNull { it.second.performance[0].mistakes > 0 }?.first?.number
+    }
+
+    /** Each finished game of match [matchId] with its stored summary (also for games whose records were cleared). */
+    suspend fun gameSummaries(matchId: Long): List<Pair<GameEntity, GameSummary>> =
+        dao.games(matchId).mapNotNull { e -> runCatching { e to AppJson.decodeFromString<GameSummary>(e.summary) }.getOrNull() }
+
+    /**
+     * Stores game [e] analyzed again ([g]): its record and summary, and the match's totals if the
+     * match is over (statistics and PR history read both).
+     */
+    suspend fun saveReanalyzedGame(e: GameEntity, g: GameState, matchLength: Int): GameEntity {
+        val updated = e.copy(record = AppJson.encodeToString(g), summary = AppJson.encodeToString(Summaries.of(g, matchLength)))
+        dao.updateGame(updated)
+        val m = dao.match(e.matchId) ?: return updated
+        if (m.status != MatchStatus.IN_PROGRESS) {
+            val summaries = dao.games(m.id).map { AppJson.decodeFromString<GameSummary>(it.summary) }
+            dao.upsertMatch(
+                m.copy(
+                    humanPerformance = AppJson.encodeToString(summaries.fold(PerformanceTotals()) { acc, s -> acc + s.performance[0] }),
+                    cpuPerformance = AppJson.encodeToString(summaries.fold(PerformanceTotals()) { acc, s -> acc + s.performance[1] }),
+                ),
+            )
+        }
+        return updated
+    }
+
+    /** Stores a saved blunder analyzed again ([d]); its error is the new one. */
+    suspend fun saveReanalyzedBlunder(b: BlunderEntity, d: DecisionRecord): BlunderEntity {
+        val updated = b.copy(error = (d.error ?: 0f) * XgRules.errorFactor(b.matchLength), record = AppJson.encodeToString(d))
+        dao.updateBlunder(updated)
+        return updated
+    }
+
+    suspend fun deleteMatch(id: Long) = dao.deleteMatchWithGames(id)
+
+    /** Deletes all finished matches and games, and with them the statistics and rating (not the blunder list). */
+    suspend fun clearMatchHistory() {
+        dao.deleteAllGames()
+        dao.deleteFinishedMatches()
+    }
+
+    /**
+     * Deletes the move-by-move records (review, export) of the finished matches started more
+     * than [olderThanDays] days ago (null = all); their results and statistics are kept and
+     * they leave the History list. The blunder list keeps its own copies.
+     */
+    suspend fun clearGameRecords(olderThanDays: Int?) {
+        val before = olderThanDays?.let { System.currentTimeMillis() - it * 86_400_000L } ?: Long.MAX_VALUE
+        dao.clearRecords(before)
+        db.useWriterConnection { it.usePrepared("VACUUM") { s -> s.step() } }
+    }
+
+    /** Statistics and rating start again: every finished match is left out (they stay in the Match Library). */
+    suspend fun clearStatistics() {
+        dao.excludeFinishedFromStats()
+        recomputeRatings()
+    }
+
+    /** Counts match [id] in the statistics and rating, or leaves it out. */
+    suspend fun setInStats(id: Long, inStats: Boolean) {
+        dao.setInStats(id, inStats)
+        recomputeRatings()
+    }
+
+    /**
+     * Recomputes the FIBS-formula rating along the finished matches that count, oldest first
+     * (the same formula as when each match finished); matches left out get no rating.
+     */
+    suspend fun recomputeRatings() {
+        var rating = Elo.START
+        var experience = 0
+        for (m in dao.finishedMatchesChronological()) {
+            if (!m.inStats || m.winner == null) {
+                if (m.eloBefore != null || m.eloAfter != null) dao.setRating(m.id, null, null)
+                continue
+            }
+            val after = Elo.update(rating, experience, Opponent.rating(m.cpuLevel), m.length, won = m.winner == Player.HUMAN)
+            if (m.eloBefore != rating || m.eloAfter != after) dao.setRating(m.id, rating, after)
+            rating = after
+            experience += m.length
+        }
+    }
+
+    suspend fun clearBlunders() = dao.deleteAllBlunders()
+
+    // ---- blunder list ----------------------------------------------------------------
+
+    /** Puts the decision the player marked (at [index] of [m]'s current game) in New Marked; analyzed later, if it isn't yet. */
+    suspend fun saveMarked(m: MatchState, index: Int) {
+        val rec = m.game.decisions.getOrNull(index)?.turned() ?: return
+        val error = (rec.error ?: 0f) * XgRules.errorFactor(m.rules.length)
+        val record = AppJson.encodeToString(rec)
+        val id = dao.insertBlunder(
+            BlunderEntity(
+                matchId = m.id, gameNumber = m.gameNumber, decisionIndex = index, playedAt = System.currentTimeMillis(),
+                matchLength = m.rules.length, cpuLevel = m.opponentKey, error = error, record = record, marked = true,
+            ),
+        )
+        if (id <= 0) dao.blunderAt(m.id, m.gameNumber, index)?.let { dao.setMarkedBlunder(it.id, error, record) }
+    }
+
+    /** Takes the mark off the decision at [index]: it leaves New Marked, and returns to New errors if it was a mistake of at least [minError]. */
+    suspend fun unmarkDecision(m: MatchState, index: Int, minError: Float) {
+        dao.blunderAt(m.id, m.gameNumber, index)?.takeIf { it.marked }?.let { dao.deleteBlunder(it.id) }
+        saveIfBlunder(m, index, Severity.ERROR, minError)
+    }
+
+    /** Saves the decision at [index] of [m]'s current game if it is one of the human's mistakes of at least [min]. */
+    suspend fun saveIfBlunder(m: MatchState, index: Int, min: Severity = Severity.BLUNDER, minError: Float = 0f) {
+        val d = m.game.decisions.getOrNull(index) ?: return
+        saveIfBlunder(d, m.id, m.gameNumber, index, m.rules.length, m.opponentKey, min, minError = minError)
+    }
+
+    /**
+     * Saves [d] (decision [index] of game [gameNumber] of match [matchId]) if it is one of the human's
+     * mistakes of at least [min]; with [opponent], the opponent's (saved from the opponent's side).
+     */
+    suspend fun saveIfBlunder(
+        d: DecisionRecord, matchId: Long, gameNumber: Int, index: Int, matchLength: Int, opponentKey: String, min: Severity,
+        opponent: Boolean = false,
+        /** The weighted error it must cost at least (Settings → My positions → New errors). */
+        minError: Float = 0f,
+    ) {
+        if (opponent == (d.player == Player.HUMAN)) return
+        val rec = d.turned()
+        // Marked: it waits in New Marked whatever it cost, now with its analysis.
+        dao.blunderAt(matchId, gameNumber, index)?.takeIf { it.marked }?.let { e ->
+            rec.error?.let { dao.setMarkedBlunder(e.id, it * XgRules.errorFactor(matchLength), AppJson.encodeToString(rec)) }
+            return
+        }
+        val error = (rec.error ?: return) * XgRules.errorFactor(matchLength)
+        if (!Blunders.isBlunder(rec, error, min) || error < minError) return
+        val e = BlunderEntity(
+            matchId = matchId, gameNumber = gameNumber, decisionIndex = index,
+            playedAt = System.currentTimeMillis(), matchLength = matchLength, cpuLevel = opponentKey,
+            error = error, record = AppJson.encodeToString(rec), opponent = opponent,
+        )
+        val id = dao.insertBlunder(e)
+        if (id > 0) onNewBlunder?.invoke(SavedBlunder(e.copy(id = id), rec))
+    }
+
+    /** Removes the blunders [ids] (Clear with a filter on). */
+    suspend fun removeBlunders(ids: Collection<Long>) = ids.chunked(500).forEach { dao.deleteBlunders(it) }
+
+    // ---- imported matches ------------------------------------------------------------
+
+    /**
+     * Stores a match read from a .mat file ([MatImport]) as a finished match, left out of the
+     * statistics, with all its decisions waiting for the background analysis. [blundersBoth]:
+     * the opponent's mistakes go on the blunder list too. Returns the games to analyze.
+     */
+    suspend fun importMatch(im: MatImport.ImportedMatch, blundersBoth: Boolean): List<GameKey> {
+        // Listed by when it joined the library (the Match Library is newest first).
+        val started = System.currentTimeMillis()
+        val id = dao.insertMatch(
+            MatchEntity(
+                startedAt = started, finishedAt = started, length = im.rules.length, cpuLevel = Opponent.imported(im.names[Player.CPU]),
+                useCube = im.rules.useCube, jacoby = im.rules.jacoby, crawford = im.rules.crawford,
+                humanScore = im.score[0], cpuScore = im.score[1], winner = im.winner,
+                status = if (im.rules.isMoney || im.winner != null) MatchStatus.FINISHED else MatchStatus.ABANDONED,
+                games = im.games.size, inStats = false, imported = true, blundersBoth = blundersBoth,
+            ),
+        )
+        val keys = im.games.map { g ->
+            val r = requireNotNull(g.state.result)
+            dao.insertGame(
+                GameEntity(
+                    matchId = id, number = g.number, finishedAt = started, winner = r.winner, winType = r.type.name, points = r.points,
+                    summary = AppJson.encodeToString(Summaries.of(g.state, im.rules.length)), record = AppJson.encodeToString(g.state),
+                    scoreBeforeHuman = g.score[0], scoreBeforeCpu = g.score[1],
+                ),
+            )
+            GameKey(id, g.number)
+        }
+        enforceLibraryLimit()
+        return keys
+    }
+
+    /** The saved blunders that pass [filter] (label keys), in [sort] order (newest first within equal errors). */
+    suspend fun blunders(sort: BlunderSort, filter: Set<String> = emptySet(), marked: Boolean = false): List<SavedBlunder> {
+        val list = dao.blunders(marked).mapNotNull { e ->
+            runCatching { SavedBlunder(e, AppJson.decodeFromString<DecisionRecord>(e.record)) }.getOrNull()
+        }.filter { filter.isEmpty() || Labels.matches(it.labels, filter) }
+        return when (sort) {
+            BlunderSort.NEWEST -> list
+            BlunderSort.BIGGEST -> list.sortedByDescending { it.entity.error }
+        }
+    }
+
+    suspend fun removeBlunder(id: Long) = dao.deleteBlunder(id)
+
+    /**
+     * The positions of match [matchId]'s errors: its decisions of at least [min] (either player's, for
+     * imported matches with both players' errors) and the errors of it still in New errors.
+     */
+    suspend fun errorPositions(matchId: Long, min: Severity): List<StudyPosition> {
+        val m = dao.match(matchId) ?: return emptyList()
+        val factor = XgRules.errorFactor(m.length)
+        val fromGames = games(matchId).flatMap { (_, g) ->
+            g.decisions.filter { d -> XgRules.severity((d.scoredError ?: 0f) * factor).atLeast(min) }
+                .mapNotNull { d -> StudyPosition.of(d, m.length, m.jacoby) }
+        }
+        val waiting = dao.blundersOfMatch(matchId).filter { !it.marked }.mapNotNull { e ->
+            runCatching { AppJson.decodeFromString<DecisionRecord>(e.record) }.getOrNull()?.let { StudyPosition.of(it, e.matchLength, m.jacoby) }
+        }
+        return (fromGames + waiting).distinctBy { it.xgid to it.doubled }
+    }
+
+    /** Deletes match [matchId]'s errors from New errors; returns how many. */
+    suspend fun removeBlundersOf(matchId: Long): Int = dao.deleteBlundersOfMatch(matchId)
+
+    /** How many errors wait in New errors. */
+    suspend fun blunderCount(): Int = dao.blunderCount()
+
+    /** How many marked positions wait in New Marked. */
+    suspend fun markedCount(): Int = dao.blunderCount(marked = true)
+
+    /** Puts back a removed blunder (undo). */
+    suspend fun restoreBlunder(e: BlunderEntity) {
+        dao.insertBlunder(e)
+    }
+
+    // ---- statistics ------------------------------------------------------------------
+
+    suspend fun stats(filter: StatsFilter): StatsReport {
+        val since = filter.period.days?.let { System.currentTimeMillis() - it * 86_400_000L }
+        val matches = dao.allMatches().associateBy { it.id }
+        fun included(m: MatchEntity): Boolean {
+            if (!m.inStats) return false
+            if (filter.type == MatchTypeFilter.MATCHES && m.length == 0) return false
+            if (filter.type == MatchTypeFilter.MONEY && m.length != 0) return false
+            return true
+        }
+
+        var gamesPlayed = 0
+        var gamesWon = 0
+        var gammonsWon = 0
+        var gammonsLost = 0
+        var bgWon = 0
+        var bgLost = 0
+        var moneyGames = 0
+        var moneyWon = 0
+        var moneyLost = 0
+        var human = PerformanceTotals()
+        var cpu = PerformanceTotals()
+        var humanDice = DiceTotals()
+        var cpuDice = DiceTotals()
+
+        for (g in dao.allGameSummaries()) {
+            val m = matches[g.matchId] ?: continue
+            if (!included(m)) continue
+            if (since != null && g.finishedAt < since) continue
+            val s = runCatching { AppJson.decodeFromString<GameSummary>(g.summary) }.getOrNull() ?: continue
+            gamesPlayed++
+            val won = s.result.winner == Player.HUMAN
+            if (won) gamesWon++
+            when (s.result.type) {
+                WinType.GAMMON -> if (won) gammonsWon++ else gammonsLost++
+                WinType.BACKGAMMON -> if (won) bgWon++ else bgLost++
+                WinType.SINGLE -> Unit
+            }
+            if (m.length == 0) {
+                moneyGames++
+                if (won) moneyWon += s.result.points else moneyLost += s.result.points
+            }
+            human += s.performance[0]
+            cpu += s.performance[1]
+            humanDice += s.dice[0]
+            cpuDice += s.dice[1]
+        }
+
+        val finished = matches.values.filter {
+            it.status == MatchStatus.FINISHED && included(it) && (since == null || (it.finishedAt ?: 0) >= since)
+        }.sortedBy { it.finishedAt }
+        val realMatches = finished.filter { it.length > 0 }
+        val prHistory = finished.mapNotNull { m ->
+            val p = m.humanPerformance?.let { runCatching { AppJson.decodeFromString<PerformanceTotals>(it) }.getOrNull() }
+            val pr = p?.pr ?: return@mapNotNull null
+            PrPoint(m.finishedAt ?: m.startedAt, pr, p.checkerPr, p.cubePr, m.length)
+        }
+
+        val rated = dao.ratedMatchesChronological().filter { it.eloAfter != null }
+        val eloHistory = rated.map { (it.finishedAt ?: it.startedAt) to it.eloAfter!! }
+
+        return StatsReport(
+            matchesPlayed = realMatches.size,
+            matchesWon = realMatches.count { it.winner == Player.HUMAN },
+            gamesPlayed = gamesPlayed, gamesWon = gamesWon,
+            gammonsWon = gammonsWon, gammonsLost = gammonsLost,
+            backgammonsWon = bgWon, backgammonsLost = bgLost,
+            moneyGames = moneyGames, moneyPointsWon = moneyWon, moneyPointsLost = moneyLost,
+            human = human, cpu = cpu, humanDice = humanDice, cpuDice = cpuDice,
+            elo = eloHistory.lastOrNull()?.second ?: Elo.START,
+            eloHistory = eloHistory,
+            experience = rated.sumOf { it.length },
+            prHistory = prHistory,
+        )
+    }
+}
+
+/** The oldest finished matches of [all] that go to bring the Match Library down to [max] (none while it is within the limit). */
+fun matchesOverLimit(all: List<MatchEntity>, max: Int): List<MatchEntity> =
+    all.filter { it.status != MatchStatus.IN_PROGRESS }.sortedBy { it.startedAt }.take((all.size - max).coerceAtLeast(0))

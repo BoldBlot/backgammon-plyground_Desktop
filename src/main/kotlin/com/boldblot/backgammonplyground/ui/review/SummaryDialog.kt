@@ -1,0 +1,245 @@
+package com.boldblot.backgammonplyground.ui.review
+
+import com.boldblot.backgammonplyground.ui.components.desktopVerticalScroll
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.material3.Checkbox
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.semantics.Role
+import com.boldblot.backgammonplyground.data.MatchStatus
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import com.boldblot.backgammonplyground.PlyGroundApp
+import com.boldblot.backgammonplyground.core.GameResult
+import com.boldblot.backgammonplyground.core.GameSummary
+import com.boldblot.backgammonplyground.core.Opponent
+import com.boldblot.backgammonplyground.core.Player
+import com.boldblot.backgammonplyground.core.WinType
+import com.boldblot.backgammonplyground.data.GameEntity
+import com.boldblot.backgammonplyground.data.MatchEntity
+import com.boldblot.backgammonplyground.data.MatchReport
+import com.boldblot.backgammonplyground.ui.components.fmt
+import com.boldblot.backgammonplyground.ui.game.PerformanceRows
+import com.boldblot.backgammonplyground.ui.game.SummaryRow
+
+/**
+ * The end-of-game summary for a saved match: game [gameNumber] (null: the last one) or the whole
+ * match / session, with the same rows as at the end of a game (PR, rating, luck, errors).
+ */
+@Composable
+fun SavedSummaryDialog(
+    app: PlyGroundApp, matchId: Long, gameNumber: Int?, startWithMatch: Boolean, onDismiss: () -> Unit,
+    /** A money session just ended in "after the match" training: its mistake count and a review of them (from game n). */
+    onReviewMistakes: ((Int) -> Unit)? = null,
+    /** Offers Delete for a finished match; called once it is deleted. */
+    onDeleted: (() -> Unit)? = null,
+) {
+    var deleting by remember { mutableStateOf(false) }
+    if (deleting) DeleteMatchDialog(app, matchId, onDismiss = { deleting = false }) { deleting = false; onDeleted?.invoke() }
+    var match by remember { mutableStateOf<MatchEntity?>(null) }
+    var games by remember { mutableStateOf<List<Pair<GameEntity, GameSummary>>>(emptyList()) }
+    var report by remember { mutableStateOf<MatchReport?>(null) }
+    LaunchedEffect(matchId) {
+        match = app.repository.match(matchId)
+        games = app.repository.gameSummaries(matchId)
+        report = runCatching { app.repository.matchReport(matchId) }.getOrNull()
+    }
+    val m = match
+    var shown by remember(games) { mutableStateOf(games.indexOfFirst { it.first.number == gameNumber }.takeIf { it >= 0 } ?: games.lastIndex) }
+    val game = games.getOrNull(shown)
+    var showMatch by remember(games) { mutableStateOf(startWithMatch && games.size > 1) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (m == null) "Summary" else if (m.length == 0) "Money session" else "${m.length}-point match") },
+        text = {
+            Column(Modifier.desktopVerticalScroll()) {
+                if (m == null || game == null) {
+                    Text("No finished games yet.")
+                    return@Column
+                }
+                Text(
+                    "vs ${Opponent.name(m.cpuLevel)} · " +
+                        (if (m.length == 0) "session" else "score") + ": you ${m.humanScore}, computer ${m.cpuScore} · ${m.games} game" +
+                        if (m.games == 1) "" else "s",
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (onReviewMistakes != null) {
+                    val n = games.sumOf { it.second.performance[0].mistakes }
+                    Text(
+                        when (n) {
+                            0 -> "No errors or blunders this session. Well played!"
+                            1 -> "You made 1 error or blunder this session."
+                            else -> "You made $n errors and blunders this session."
+                        },
+                        style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+                val r = report
+                if (games.size > 1 && r != null) {
+                    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                        SegmentedButton(selected = !showMatch, onClick = { showMatch = false }, shape = SegmentedButtonDefaults.itemShape(0, 2)) {
+                            Text("Game ${game.first.number}", maxLines = 1)
+                        }
+                        SegmentedButton(selected = showMatch, onClick = { showMatch = true }, shape = SegmentedButtonDefaults.itemShape(1, 2)) {
+                            Text(if (m.length == 0) "Session" else "Match", maxLines = 1)
+                        }
+                    }
+                }
+                if (games.size > 1 && !(showMatch && r != null)) {
+                    GameStepper(game.first.number, shown, games.size) { shown = it }
+                }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                if (showMatch && r != null) {
+                    SummaryRow(if (m.length > 0) "${m.length}-point match" else "Money session", "You", "Computer", header = true)
+                    SummaryRow("Games won", r.gamesWon[0].toString(), r.gamesWon[1].toString(), strong = true)
+                    PerformanceRows(r.human, r.cpu)
+                    val before = r.eloBefore
+                    val after = r.eloAfter
+                    if (before != null && after != null) {
+                        val change = after - before
+                        Text(
+                            "Your FIBS rating: ${fmt(before, 1)} → ${fmt(after, 1)} (${if (change >= 0) "+" else "−"}${fmt(kotlin.math.abs(change), 1)})",
+                            style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 6.dp),
+                        )
+                    }
+                } else {
+                    SavedGameRows(game.first, game.second)
+                }
+                Text(
+                    "Luck: each player's rolls compared with the average roll in the same position, so both " +
+                        "players can be lucky; the net luck shows who was luckier.",
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+        },
+        confirmButton = {
+            Row {
+                if (onDeleted != null && m != null && m.status != MatchStatus.IN_PROGRESS) {
+                    TextButton(onClick = { deleting = true }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                }
+                TextButton(onClick = onDismiss) { Text(if (onReviewMistakes != null) "Done" else "Close") }
+            }
+        },
+        dismissButton = onReviewMistakes?.let { review ->
+            games.firstOrNull { it.second.performance[0].mistakes > 0 }?.let { (e, _) ->
+                { TextButton(onClick = { review(e.number) }) { Text("Review my mistakes") } }
+            }
+        },
+    )
+}
+
+/** "‹ Game 3 of 7 ›": steps through the games of a summary ([index] in a list of [count]). */
+@Composable
+internal fun GameStepper(number: Int, index: Int, count: Int, onStep: (Int) -> Unit) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = { onStep(index - 1) }, enabled = index > 0) {
+            Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, "Previous game")
+        }
+        Text("Game $number of $count", Modifier.weight(1f), textAlign = TextAlign.Center, style = MaterialTheme.typography.titleSmall)
+        IconButton(onClick = { onStep(index + 1) }, enabled = index < count - 1) {
+            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, "Next game")
+        }
+    }
+}
+
+/** A saved game's result line and its rows (PR, rating, luck, errors). */
+@Composable
+internal fun SavedGameRows(e: GameEntity, s: GameSummary) {
+    Text(
+        "Game ${e.number} (${e.scoreBeforeHuman}-${e.scoreBeforeCpu}): " + resultText(s.result),
+        style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 4.dp),
+    )
+    SummaryRow("Game ${e.number}", "You", "Computer", header = true)
+    PerformanceRows(s.performance[0], s.performance[1])
+}
+
+private fun resultText(res: GameResult): String {
+    val kind = when (res.type) {
+        WinType.SINGLE -> if (res.byPass) "by a pass" else "a single game"
+        WinType.GAMMON -> "a gammon"
+        WinType.BACKGAMMON -> "a backgammon"
+    }
+    return "${if (res.winner == Player.HUMAN) "you win" else "computer wins"} $kind, " +
+        "+${res.points} point${if (res.points > 1) "s" else ""}" + if (res.resigned) " (resigned)" else ""
+}
+
+/**
+ * Deletes match [matchId]: it leaves history, statistics and the Match Library; with [errors] its errors also
+ * leave New errors, and the positions filed from them leave My positions.
+ */
+suspend fun deleteMatchEverywhere(app: PlyGroundApp, matchId: Long, errors: Boolean) {
+    if (errors) {
+        // Every error that could have been filed (the New errors minimum is never below an error).
+        app.positions.removeFiled(app.repository.errorPositions(matchId, com.boldblot.backgammonplyground.core.Severity.ERROR))
+        app.repository.removeBlundersOf(matchId)
+    }
+    app.repository.deleteMatch(matchId)
+}
+
+/** "Delete this match?" with "Also delete its errors" (ticked); [onDeleted] after [deleteMatchEverywhere], or [onConfirm] instead to do it elsewhere. */
+@Composable
+fun DeleteMatchDialog(
+    app: PlyGroundApp, matchId: Long, onDismiss: () -> Unit,
+    onConfirm: ((errors: Boolean) -> Unit)? = null, onDeleted: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var errors by remember { mutableStateOf(true) }
+    var working by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = { if (!working) onDismiss() },
+        title = { Text("Delete this match?") },
+        text = {
+            Column {
+                Text("Its games leave the Match Library, your history and your statistics. This cannot be undone.")
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 8.dp).toggleable(errors, role = Role.Checkbox) { errors = it },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(checked = errors, onCheckedChange = null)
+                    Text("Also delete its errors: from New errors, and the positions they made in My positions", Modifier.padding(start = 8.dp))
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = !working, onClick = {
+                if (onConfirm != null) { onConfirm(errors); return@TextButton }
+                working = true
+                scope.launch {
+                    deleteMatchEverywhere(app, matchId, errors)
+                    onDeleted()
+                }
+            }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !working) { Text("Cancel") } },
+    )
+}
